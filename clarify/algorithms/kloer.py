@@ -8,11 +8,12 @@ Analyst-then-coder clarification. A first LLM call acts as a requirements
 analyst, decoupled from code generation: it lists the contradictory, ambiguous
 or incomplete points of the task, discards those that can be inferred from the
 examples, signature or convention, and asks the user one atomic question about
-the remaining point most likely to change the function's behaviour. A second
-LLM call implements the function from the task and the clarification, using a
-fixed precedence order to resolve conflicts (clarification > examples >
-signature > conventional reading). The output is checked for a fenced Python
-block defining the entry point and regenerated if needed.
+the remaining point most likely to change the function's behaviour, phrased as
+two concrete alternatives. A second LLM call implements the function from the
+task and the clarification, using a fixed precedence order to resolve conflicts
+(clarification > examples > signature > conventional reading). The returned
+code is sanitised deterministically (fence variants, demo code, renamed entry
+point) and regenerated if no valid implementation is found.
 
 Team: Kloer
 Team Members: Milos Ojdanic, Guillaume Haben, Sami Lazreg
@@ -34,9 +35,11 @@ from clarify.env import (
 )
 from clarify.runtime import _validate_and_parse_evalplus_result
 
+KLOER_VERSION = "0.1"
+
 ANALYST_PROMPT = """
 You are a requirements analyst reviewing a coding task before any code is written.
-The task asks for a Python function named `{entry_point}`.
+The task asks for a Python function named {entry_point}.
 
 ### Task
 {prompt}
@@ -46,7 +49,7 @@ The task asks for a Python function named `{entry_point}`.
 
 ### Instructions
 1. List every point where the task is contradictory, ambiguous or incomplete, such that two
-   reasonable developers could write versions of `{entry_point}` that return different outputs
+   reasonable developers could write versions of {entry_point} that return different outputs
    for the same input. Typical points: statements that conflict with each other or with the
    examples, the exact return value or type, the input format or argument order, inclusive vs.
    exclusive bounds, ordering, tie-breaking, duplicates, empty or edge-case inputs, and what to
@@ -57,13 +60,26 @@ The task asks for a Python function named `{entry_point}`.
 3. Pick the ONE unresolved point that is most likely to make hidden tests fail if guessed wrong.
    Explicit contradictions matter more than vague wording.
 4. Write one clarifying question about that point. The question must:
-   - ask for exactly one fact (no lists, no "and also", no sub-questions);
+   - ask for exactly one fact (no lists, no "and also", no sub-questions, a single question mark);
    - ask about the required behaviour, never about the implementation, algorithm or test cases;
-   - be self-contained and answerable in one sentence, ideally offering the two most plausible
-     options (e.g. "Should X return A or B when ...?").
+   - offer the two most plausible concrete alternatives (e.g. "Should X return A or B when ...?");
+   - never be a yes/no question that only confirms the obvious reading of the task;
+   - be self-contained, answerable in one sentence, and written as plain text without backticks
+     or code formatting.
 
 Answer with a JSON object only:
 {"issues": [{"point": "...", "resolvable": true, "assumption": "..."}], "question": "..."}
+""".strip()
+
+FALLBACK_QUESTION_PROMPT = """
+A user asked for a Python function named {entry_point}:
+
+{prompt}
+
+Write the single most important clarifying question whose answer would change what
+{entry_point} returns. Ask for exactly one fact, offer the two most plausible concrete
+alternatives, and do not ask about implementation details or test cases.
+Reply with the question only, as plain text without backticks.
 """.strip()
 
 CODER_PROMPT = """
@@ -97,6 +113,26 @@ FORMAT_REMINDER = (
 )
 
 
+# Question hygiene ---------------------------------------------------------------------------
+
+
+def clean_question(question: str) -> str:
+    """Makes a question safe for the simulated user.
+
+    The SDK parses the simulated user's reply with ``ANSWERS=`(.+?)` ``, so an answer that echoes
+    a backtick from the question is cut short. Backticks are therefore removed. Only the first
+    question is kept if several were produced (atomicity).
+    """
+    question = question.replace("`", "").strip().strip('"').strip()
+    question = re.sub(r"\s+", " ", question)
+    if question.count("?") > 1:
+        question = question[: question.index("?") + 1]
+    return question
+
+
+# Code extraction and sanitisation ---------------------------------------------------------------
+
+
 def parse_json_object(text: str) -> dict[str, Any]:
     """Extracts the first JSON object from an LLM response (tolerates code fences)."""
     match = re.search(r"\{.*\}", text, flags=re.DOTALL)
@@ -109,33 +145,85 @@ def parse_json_object(text: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def extract_code(response: str, entry_point: str) -> str | None:
-    """Returns the code defining `entry_point`, tolerating fence variants such as
-    "``` python", "```py" or an untagged ``` block (common with local models)."""
-    normalized = re.sub(r"```[ \t]*(?:python3?|py)\b", "```python", response, flags=re.IGNORECASE)
-    try:
-        code = _validate_and_parse_evalplus_result(normalized)
-        if defines_entry_point(code, entry_point):
-            return code
-    except ValueError:
-        pass
-    for block in re.findall(r"```[^\n]*\n(.*?)```", normalized, flags=re.DOTALL):
-        if defines_entry_point(block, entry_point):
-            return block
-    if defines_entry_point(response, entry_point):  # bare code without any fence
-        return response
-    return None
+def top_level_names(tree: ast.Module) -> set[str]:
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+    return names
 
 
-def defines_entry_point(code: str, entry_point: str) -> bool:
+def is_main_guard(node: ast.stmt) -> bool:
+    return isinstance(node, ast.If) and "__main__" in ast.unparse(node.test)
+
+
+def calls_input(node: ast.stmt) -> bool:
+    return any(
+        isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "input"
+        for n in ast.walk(node)
+    )
+
+
+def is_demo_statement(node: ast.stmt, local_functions: set[str]) -> bool:
+    """Top-level code that only demonstrates or tests the solution."""
+    if is_main_guard(node) or isinstance(node, ast.Assert) or calls_input(node):
+        return True
+    if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+        func = node.value.func
+        name = func.id if isinstance(func, ast.Name) else None
+        return name == "print" or name in local_functions
+    return False
+
+
+def sanitize_code(code: str, entry_point: str) -> str | None:
+    """Removes demo code and binds the entry point; returns None if it cannot be bound."""
     try:
         tree = ast.parse(code)
     except SyntaxError:
-        return False
-    return any(
-        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == entry_point
-        for node in ast.walk(tree)
-    )
+        return None
+
+    local_functions = {
+        n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    body = [n for n in tree.body if not is_demo_statement(n, local_functions)]
+    changed = len(body) != len(tree.body)
+    tree.body = body
+
+    if entry_point not in top_level_names(tree):
+        functions = [n.name for n in body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        same_name = [f for f in functions if f.lower() == entry_point.lower()]
+        target = same_name[0] if same_name else (functions[0] if len(functions) == 1 else None)
+        if target is None:
+            return None
+        tree.body.append(ast.parse(f"{entry_point} = {target}").body[0])
+        changed = True
+
+    return ast.unparse(tree) if changed else code
+
+
+def extract_code(response: str, entry_point: str) -> str | None:
+    """Returns sanitised code defining `entry_point`, tolerating fence variants such as
+    "``` python", "```py" or an untagged ``` block (common with local models)."""
+    normalized = re.sub(r"```[ \t]*(?:python3?|py)\b", "```python", response, flags=re.IGNORECASE)
+    candidates = []
+    try:
+        candidates.append(_validate_and_parse_evalplus_result(normalized))
+    except ValueError:
+        pass
+    candidates += re.findall(r"```[^\n]*\n(.*?)```", normalized, flags=re.DOTALL)
+    candidates.append(response)  # bare code without any fence
+    for block in candidates:
+        code = sanitize_code(block, entry_point)
+        if code is not None:
+            return code
+    return None
+
+
+# Algorithm ------------------------------------------------------------------------------------
 
 
 class Kloer(ClarificationAlgorithmBase):
@@ -150,18 +238,27 @@ class Kloer(ClarificationAlgorithmBase):
             return "(none)"
         return "\n".join(f"Q: {q}\nA: {a}" for q, a in clarifications)
 
+    def fill(self, template: str, problem: dict[str, Any], **values: str) -> str:
+        text = template.replace("{entry_point}", problem["entry_point"]).replace(
+            "{prompt}", problem["prompt"]
+        )
+        for key, value in values.items():
+            text = text.replace("{" + key + "}", value)
+        return text
+
     def analyse(
         self,
         env: ClarificationEnvironment,
         problem: dict[str, Any],
         clarifications: list[tuple[str, str]],
     ) -> dict[str, Any]:
-        prompt = (
-            ANALYST_PROMPT.replace("{entry_point}", problem["entry_point"])
-            .replace("{prompt}", problem["prompt"])
-            .replace("{clarifications}", self.format_clarifications(clarifications))
+        prompt = self.fill(
+            ANALYST_PROMPT, problem, clarifications=self.format_clarifications(clarifications)
         )
         return parse_json_object(env.llm(prompt))
+
+    def fallback_question(self, env: ClarificationEnvironment, problem: dict[str, Any]) -> str:
+        return clean_question(env.llm(self.fill(FALLBACK_QUESTION_PROMPT, problem)))
 
     def implement(
         self,
@@ -171,11 +268,11 @@ class Kloer(ClarificationAlgorithmBase):
         assumptions: list[str],
     ) -> str:
         entry_point = problem["entry_point"]
-        content = (
-            CODER_PROMPT.replace("{entry_point}", entry_point)
-            .replace("{prompt}", problem["prompt"])
-            .replace("{clarifications}", self.format_clarifications(clarifications))
-            .replace("{assumptions}", "\n".join(f"- {a}" for a in assumptions) or "(none)")
+        content = self.fill(
+            CODER_PROMPT,
+            problem,
+            clarifications=self.format_clarifications(clarifications),
+            assumptions="\n".join(f"- {a}" for a in assumptions) or "(none)",
         )
         messages = [{"role": "user", "content": content}]
         response = ""
@@ -205,9 +302,14 @@ class Kloer(ClarificationAlgorithmBase):
                     for i in issues
                     if i.get("resolvable") and i.get("assumption")
                 ]
-                question = str(analysis.get("question") or "").strip()
+                question = clean_question(str(analysis.get("question") or ""))
                 has_open_issue = any(not i.get("resolvable", False) for i in issues)
-                if not question or not (has_open_issue or self.config["always_ask"]):
+                if not (has_open_issue or self.config["always_ask"]):
+                    break
+                if not question and not clarifications:
+                    # Analysis failed or returned no question: still use the turn.
+                    question = self.fallback_question(env, problem)
+                if not question:
                     break
                 try:
                     answer = env.ask_human(question)
