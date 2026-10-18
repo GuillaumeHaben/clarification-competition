@@ -4,26 +4,35 @@
 
 """Kloer.
 
-Analyse, ask, repair, implement.
+Analyse, explore, ask, repair, implement, verify.
 
 1. Analyse. A requirements-analyst call, decoupled from code generation, reviews the task
    against an ambiguity checklist (contradictions plus the ambiguity taxonomy of
-   ClarifyCodeBench, Fang et al. 2026), resolves what the examples, signature or convention
-   already settle, and picks the one open point most likely to break hidden tests.
-2. Ask. One atomic question about that point. When the point is a contradiction, the question
-   quotes the two conflicting statements and asks which one holds (the "which source is
-   correct" confirmation of VClare's spec-level repair, Zhao et al. 2026); otherwise it offers
-   two concrete alternatives.
-3. Repair. The task is rewritten into a structured specification (signature, description,
-   inputs, output, rules, examples), editing only what the answer invalidates (VClare's
-   targeted repair) and laid out as redundant layers, which makes code generation more robust
-   (Akli et al. 2026, "When prompt under-specification improves code correctness"). The rewrite
-   applies meaning-preserving rules in IF-THEN-EXCEPT form: terminology clarification, math
-   symbols in plain English, binary-predicate completion and function-name neutralisation
-   (the universal rules of DualFix, Akli et al. 2026, "From Failing to Passing").
-4. Implement. The coder works from the repaired specification; the code is sanitised
-   deterministically (fence variants, demo code) and the neutral name is bound back to the
-   required entry point.
+   ClarifyCodeBench, Fang et al. 2026), picks the open point most likely to break hidden tests,
+   drafts a question about it and writes two or three explicit readings of the task.
+2. Explore. One candidate implementation is written per reading, rather than by re-sampling,
+   because sampling tends to repeat one interpretation (semantic collapse, Richter & Papadakis
+   2026). The candidates run on probe inputs written by the model (inputs only) in a single
+   sandboxed execution, and are grouped by behaviour (VClare sim-level repair, Zhao et al. 2026;
+   output inconsistency as an ambiguity signal, ClarifyGPT, Mu et al. 2024).
+3. Ask. One atomic question. If the task contains a quoted contradiction, the question quotes
+   both statements and asks which one holds (VClare spec-level repair). Otherwise, if two
+   behaviour groups differ on an ordinary input, the question states the behavioural difference
+   and illustrates it with that input and the two results (test-driven clarification, TiCoder,
+   Lahiri et al. 2022). Otherwise the analyst's question is used.
+4. Repair. The task is rewritten into a structured specification, editing only what the answer
+   invalidates (VClare targeted repair) and laid out as redundant layers (Akli et al. 2026), with
+   meaning-preserving IF-THEN-EXCEPT rules and function-name neutralisation (DualFix, Akli et
+   al. 2026). When the candidates disagree on the number of arguments of a task without a
+   signature, the extra parameters are made optional so that both call forms work.
+5. Implement and verify. The coder works from the specification. The result is executed on the
+   specification's examples; if it fails, a candidate that passes them all is preferred, else one
+   self-debugging round uses the execution feedback (Chen et al. 2024). The code is sanitised
+   deterministically and the neutral name is bound back to the required entry point.
+6. Finalise (0.3.1). Deterministic robustness for the evaluation harness: `Counter` is imported
+   (some expected outputs are Counter objects), a lower-case alias of the entry point is defined,
+   and for tasks without a signature the entry point ignores extra trailing positional arguments
+   (tests often pass a redundant length), which only changes calls that would raise TypeError.
 
 Team: Kloer
 Team Members: Milos Ojdanic, Guillaume Haben, Sami Lazreg
@@ -33,7 +42,9 @@ Main Contact: guillaume.haben@telecomnancy.net
 from __future__ import annotations
 
 import ast
+import builtins
 import json
+import keyword
 import re
 from typing import Any
 
@@ -45,7 +56,7 @@ from clarify.env import (
 )
 from clarify.runtime import _validate_and_parse_evalplus_result
 
-KLOER_VERSION = "0.2"
+KLOER_VERSION = "0.3.1"
 
 NEUTRAL_NAME = "solution"
 
@@ -96,10 +107,13 @@ easiest to overlook, so check them with particular care.
      with a single question mark. Never ask a yes/no question that only confirms the obvious
      reading. Make it self-contained, answerable in one sentence, and plain text without
      backticks or code formatting.
+5. Write the two or three most plausible complete readings of the task, one sentence each, most
+   likely first. They must lead to different outputs for some input, preferably on the point you
+   ask about. If only one reading is sensible, still give the closest alternative.
 Keep the analysis short.
 
 Answer with a JSON object only:
-{"points": [{"type": "...", "source_a": "...", "source_b": "", "resolvable": false, "assumption": "..."}], "question": "..."}
+{"points": [{"type": "...", "source_a": "...", "source_b": "", "resolvable": false, "assumption": "..."}], "interpretations": ["...", "..."], "question": "..."}
 """.strip()
 
 FALLBACK_QUESTION_PROMPT = """
@@ -131,7 +145,11 @@ original task.
 - Repair, do not reinvent. Change only the statements that a clarification contradicts or makes
   more precise, and keep every other piece of information. Keep every example whose result agrees
   with the clarifications; drop an example only if it contradicts a clarification, and never
-  compute new expected results.
+  compute new expected results. Check every example against the clarifications, including their
+  indirect consequences (e.g. if the user says 1 is not prime, an example whose result contains 1
+  is wrong), and drop each example that the clarifications make wrong.
+- Write results as Python literals; a tuple with one element needs a trailing comma, e.g.
+  ('Venus',).
 - If the task contradicts itself and no clarification settles it, keep the reading supported by
   the examples, then by the function name, then the most common reading, and state only that one.
 - Do not add requirements that appear in none of the sources above (no extra input validation,
@@ -147,7 +165,7 @@ original task.
       other return values that the task or its examples use (e.g. the strings "Valid"/"Invalid").
   R4. IF there are typos, stray symbols or broken formatting, THEN fix them without changing the
       meaning.
-- {naming_rule}
+- {naming_rule}{extra_rules}
 
 Write the specification as plain text, in exactly this format:
 SIGNATURE: def {name}(<parameters>)
@@ -188,7 +206,7 @@ Implement the Python function `{name}` described by the specification below.
   win.
 - Use exactly the function name `{name}` and the parameters of the SIGNATURE line. Include the
   helper code if your function needs it.
-- Do not add input validation, assertions or exceptions that the specification does not require.
+- Do not add input validation, assertions or exceptions that the specification does not require.{extra_rules}
 - Use only the Python standard library. Do not read input, print, or include example usage or
   tests.
 
@@ -231,6 +249,207 @@ FORMAT_REMINDER = (
 )
 
 SPEC_SECTIONS = ("SIGNATURE:", "DESCRIPTION:", "OUTPUT:")
+
+CANDIDATE_PROMPT = """
+Implement the Python function `{entry_point}` for the task below, following the given reading of
+the task exactly.
+
+### Task
+{prompt}
+
+### Reading to implement
+{reading}
+
+### Rules
+- Where the reading and the task disagree, follow the reading.
+- Keep the exact function name `{entry_point}`. If the task gives a signature, keep it; otherwise
+  choose the most natural parameter list for the described inputs.
+- Do not add input validation, assertions or exceptions that the task does not require.
+- Use only the Python standard library. Do not read input, print, or include example usage or
+  tests.
+
+Return the complete solution in a single ```python block.
+""".strip()
+
+PROBE_PROMPT = """
+Write {n} test inputs for the Python function described below. They will be used to compare
+different implementations, so each must be a valid input that the task allows.
+
+### Task
+{prompt}
+
+### Signature
+{signature}
+
+### Instructions
+- Start with small, ordinary inputs that exercise the main behaviour, then add a few edge cases
+  (empty or single-element inputs, ties, boundaries).
+- Write each input on its own line as a Python list of the positional arguments, e.g.
+  [[3, 1, 2], 2] for a call with the arguments [3, 1, 2] and 2, or ["abc"] for a call with the
+  single argument "abc".
+- Use only literals (numbers, strings, lists, tuples, dicts, sets, booleans, None) and keep each
+  input short.
+- Do not write expected outputs or any explanation.
+
+Answer with the inputs only, inside a single ```text block.
+""".strip()
+
+VALUE_QUESTION_PROMPT = """
+Two plausible readings of a coding task give different results for the same call.
+
+### Task
+{prompt}
+
+### The difference
+Reading A: {reading_a}
+With reading A, {call} returns {value_a}.
+Reading B: {reading_b}
+With reading B, {call} returns {value_b}.
+
+Write ONE clarifying question for the user that asks which behaviour the function must have.
+State the behavioural difference in plain words and illustrate it with the call and the two
+results, for example: Should the function ... (so that {call} returns {value_a}) or ... (so that
+it returns {value_b})?
+Ask for exactly one fact, with a single question mark, in at most 60 words. Do not mention
+readings, candidates or implementations. Write plain text without backticks.
+Reply with the question only.
+""".strip()
+
+GENERIC_QUESTION = (
+    "What is the most important rule that {entry_point} must follow to compute its result?"
+)
+
+VALUE_QUESTION_TEMPLATE = "For {call}, should the result be {value_a} or {value_b}?"
+
+ARITY_QUESTION_TEMPLATE = (
+    "Should {entry_point} take the arguments ({short}) or the arguments ({long})?"
+)
+
+ARITY_RULE = (
+    "Callers may pass only the first {k} of the arguments ({params}) or all {m} of them. Accept "
+    "both: give the parameters after the first {k} default values such that leaving them out "
+    "gives the same result."
+)
+
+OFFERED_RULE = (
+    "The question offered two results for {call}: {value_a} or {value_b}. If the answer settles "
+    "which result is right (or gives another one), add that call with the right result to "
+    "EXAMPLES."
+)
+
+DEBUG_PROMPT = """
+Your implementation of `{name}` does not match its specification on these examples (call,
+expected result, what your code did):
+{failures}
+
+### Specification
+{spec}
+
+### Clarifications from the user
+{clarifications}
+
+### Your implementation
+```python
+{code}
+```
+
+Fix the implementation so that it satisfies the specification and its examples. If an example
+contradicts a clarification from the user, follow the clarification. Keep the function name
+`{name}` and its parameters. Do not add input validation or exceptions that the specification
+does not require.
+
+Return the complete corrected solution in a single ```python block.
+""".strip()
+
+# Runs every candidate on every input in ONE sandboxed process (the SDK starts one container per
+# exec_code call) and prints one JSON row per candidate. Each call has a time limit; the whole run
+# has a time budget below the sandbox's own 30 s timeout. Rows are flushed one by one, so a run
+# that is killed still reports the candidates it finished.
+HARNESS = r"""
+import contextlib, copy, io, json, math, signal, sys, time
+sys.setrecursionlimit(10000)
+inf, nan = float("inf"), float("nan")
+CODES = __CODES__
+INPUTS = __INPUTS__
+EXPECTED = __EXPECTED__
+ENTRY = __ENTRY__
+LIMIT = __LIMIT__
+DEADLINE = time.monotonic() + __BUDGET__
+
+
+class KloerLate(BaseException):
+    pass
+
+
+def kloer_alarm(signum, frame):
+    raise KloerLate()
+
+
+signal.signal(signal.SIGALRM, kloer_alarm)
+
+
+def kloer_norm(value):
+    if isinstance(value, float):
+        return value if math.isnan(value) or math.isinf(value) else float(f"{value:.9g}")
+    if isinstance(value, list):
+        return [kloer_norm(x) for x in value]
+    if isinstance(value, tuple):
+        return tuple(kloer_norm(x) for x in value)
+    if isinstance(value, dict):
+        return {k: kloer_norm(x) for k, x in value.items()}
+    return value
+
+
+def kloer_same(a, b):
+    if isinstance(a, bool) or isinstance(b, bool):
+        return type(a) is type(b) and a == b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return a == b or math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-9)
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return type(a) is type(b) and len(a) == len(b) and all(map(kloer_same, a, b))
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(kloer_same(a[k], b[k]) for k in a)
+    try:
+        return bool(a == b)
+    except Exception:
+        return False
+
+
+def kloer_limited(function, *args):
+    signal.setitimer(signal.ITIMER_REAL, LIMIT)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            return function(*args)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+
+
+for index, code in enumerate(CODES):
+    try:
+        namespace = {"__name__": "kloer_candidate"}
+        kloer_limited(exec, code, namespace)
+        function = namespace[ENTRY]
+    except BaseException as exc:
+        row = [["err", "load:" + type(exc).__name__]] * len(INPUTS)
+        print("KLOER_ROW", index, json.dumps(row), flush=True)
+        continue
+    row = []
+    for position, args in enumerate(INPUTS):
+        if time.monotonic() > DEADLINE:
+            row.append(["err", "skipped"])
+            continue
+        try:
+            value = kloer_limited(function, *copy.deepcopy(args))
+        except BaseException as exc:
+            row.append(["err", type(exc).__name__])
+            continue
+        text = repr(kloer_norm(value))[:200]
+        if EXPECTED is None:
+            row.append(["ok", text])
+        else:
+            row.append(["pass" if kloer_same(value, EXPECTED[position]) else "fail", text])
+    print("KLOER_ROW", index, json.dumps(row), flush=True)
+"""
 
 
 # Question hygiene ---------------------------------------------------------------------------
@@ -376,7 +595,287 @@ def extract_code(response: str, entry_point: str, generated_name: str | None = N
     return None
 
 
+# Exploration helpers ------------------------------------------------------------------------
+
+
+def entry_function(tree: ast.Module, entry_point: str) -> ast.FunctionDef | None:
+    """The function definition bound to `entry_point` (directly or through an alias)."""
+    functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    if entry_point in functions:
+        return functions[entry_point]
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == entry_point for t in node.targets)
+            and isinstance(node.value, ast.Name)
+        ):
+            return functions.get(node.value.id)
+    return None
+
+
+def entry_params(code: str, entry_point: str) -> list[str] | None:
+    """Positional parameter names of the entry point, or None if unknown (or *args)."""
+    try:
+        function = entry_function(ast.parse(code), entry_point)
+    except SyntaxError:
+        return None
+    if function is None or function.args.vararg is not None:
+        return None
+    return [a.arg for a in function.args.posonlyargs + function.args.args]
+
+
+def required_count(code: str, entry_point: str) -> int | None:
+    try:
+        function = entry_function(ast.parse(code), entry_point)
+    except SyntaxError:
+        return None
+    if function is None:
+        return None
+    positional = function.args.posonlyargs + function.args.args
+    return len(positional) - len(function.args.defaults)
+
+
+def signature_line(code: str, entry_point: str) -> str:
+    try:
+        function = entry_function(ast.parse(code), entry_point)
+    except SyntaxError:
+        function = None
+    if function is None:
+        return f"def {entry_point}(...)"
+    return f"def {entry_point}({ast.unparse(function.args)})"
+
+
+def literal_arguments(node: ast.Call) -> list[Any] | None:
+    if node.keywords:
+        return None
+    try:
+        return [ast.literal_eval(arg) for arg in node.args]
+    except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+        return None
+
+
+def parse_probe_inputs(
+    text: str, entry_point: str, required: int, total: int, limit: int
+) -> list[list[Any]]:
+    """Argument lists from the probe response (one Python literal or call per line)."""
+    blocks = re.findall(r"```[^\n]*\n(.*?)```", text, flags=re.DOTALL)
+    lines = (blocks[0] if blocks else text).splitlines()
+    inputs: list[list[Any]] = []
+    seen: set[str] = set()
+    for line in lines:
+        line = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip().rstrip(",")
+        if not line:
+            continue
+        try:
+            node = ast.parse(line, mode="eval").body
+        except SyntaxError:
+            continue
+        if isinstance(node, ast.Call):
+            args = literal_arguments(node)
+        else:
+            try:
+                value = ast.literal_eval(node)
+            except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+                continue
+            if isinstance(value, (list, tuple)) and required <= len(value) <= total:
+                args = list(value)
+            elif total == 1:
+                args = [value]
+            else:
+                args = None
+        if args is None or not required <= len(args) <= total:
+            continue
+        key = repr(args)
+        if key not in seen and len(key) <= 400:
+            seen.add(key)
+            inputs.append(args)
+        if len(inputs) >= limit:
+            break
+    return inputs
+
+
+def build_harness(
+    codes: list[str],
+    entry_point: str,
+    inputs: list[list[Any]],
+    expected: list[Any] | None,
+    limit_s: float,
+    budget_s: float = 20.0,
+) -> str:
+    return (
+        HARNESS.replace("__EXPECTED__", repr(expected))
+        .replace("__ENTRY__", repr(entry_point))
+        .replace("__LIMIT__", repr(float(limit_s)))
+        .replace("__BUDGET__", repr(float(budget_s)))
+        .replace("__INPUTS__", repr(inputs))
+        .replace("__CODES__", repr(codes))
+    )
+
+
+def parse_harness_output(output: str, count: int) -> list[list[list[str]] | None]:
+    rows: list[list[list[str]] | None] = [None] * count
+    for line in output.splitlines():
+        if not line.startswith("KLOER_ROW "):
+            continue
+        parts = line.split(" ", 2)
+        try:
+            index, row = int(parts[1]), json.loads(parts[2])
+        except (IndexError, ValueError):
+            continue
+        if 0 <= index < count and isinstance(row, list):
+            rows[index] = row
+    return rows
+
+
+def canonical(text: str) -> Any:
+    """Value of a result repr with representation details removed (tuple/list, int/float,
+    single-element wrapping); the repr itself if it is not a literal."""
+
+    def norm(value: Any) -> Any:
+        if isinstance(value, bool) or value is None or isinstance(value, str):
+            return value
+        if isinstance(value, (int, float)):
+            return round(float(value), 9)
+        if isinstance(value, (list, tuple)):
+            items = [norm(v) for v in value]
+            return items[0] if len(items) == 1 else ("seq", tuple(map(repr, items)))
+        if isinstance(value, (set, frozenset)):
+            return ("set", tuple(sorted(map(repr, map(norm, value)))))
+        if isinstance(value, dict):
+            return ("dict", tuple(sorted((repr(norm(k)), repr(norm(v))) for k, v in value.items())))
+        return repr(value)
+
+    try:
+        return norm(ast.literal_eval(text))
+    except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+        return text
+
+
+def distinguishing_input(
+    rows: list[list[list[str]] | None], max_len: int = 60
+) -> tuple[int, int, int, int] | None:
+    """(input index, candidate a, candidate b, number of behaviour groups) or None.
+
+    Candidate a is the one that runs on most inputs (ties: the most likely reading, listed
+    first); b is the first candidate whose result differs from a's on an input where both return
+    a short value that differs in substance, not only in representation (a tuple instead of a
+    list, 2 instead of 2.0, [x] instead of x). Inputs are tried in order, ordinary inputs first.
+    """
+    present = [i for i, row in enumerate(rows) if row and any(c[0] == "ok" for c in row)]
+    if len(present) < 2:
+        return None
+    groups = {tuple(map(tuple, rows[i])) for i in present}
+    a = max(present, key=lambda i: (sum(c[0] == "ok" for c in rows[i]), -i))
+    for position in range(len(rows[a])):
+        cell_a = rows[a][position]
+        if cell_a[0] != "ok" or len(cell_a[1]) > max_len:
+            continue
+        for b in present:
+            cell_b = rows[b][position] if position < len(rows[b]) else None
+            if b == a or not cell_b or cell_b[0] != "ok" or len(cell_b[1]) > max_len:
+                continue
+            if canonical(cell_b[1]) != canonical(cell_a[1]):
+                return position, a, b, len(groups)
+    return None
+
+
+def parse_spec_examples(spec: str, names: set[str], limit: int = 10) -> list[tuple[list[Any], Any]]:
+    """(arguments, expected result) pairs from the EXAMPLES section of a specification."""
+    match = re.search(r"EXAMPLES:[ \t]*\n(.*?)(?:\nHELPER CODE:|\Z)", spec, flags=re.DOTALL)
+    if not match:
+        return []
+    examples: list[tuple[list[Any], Any]] = []
+    for line in match.group(1).splitlines():
+        line = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
+        parts = re.split(r"\s*(?:->|=>|→|==)\s*", line, maxsplit=1)
+        if len(parts) != 2:
+            continue
+        call_text, result_text = parts
+        result_text = re.sub(r"\s+#.*$", "", result_text).strip().rstrip(".;")
+        try:
+            node = ast.parse(call_text, mode="eval").body
+            expected = ast.literal_eval(result_text)
+        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+            continue
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+            continue
+        if node.func.id not in names:
+            continue
+        args = literal_arguments(node)
+        if args is not None:
+            examples.append((args, expected))
+        if len(examples) >= limit:
+            break
+    return examples
+
+
+def call_text(name: str, args: list[Any]) -> str:
+    return f"{name}({', '.join(repr(a) for a in args)})"
+
+
+# Finalisation ---------------------------------------------------------------------------------
+
+ACCEPT_EXTRA_ARGS = """
+
+def kloer_accept_extra_args(function):
+    import functools
+    import inspect
+
+    try:
+        parameters = list(inspect.signature(function).parameters.values())
+    except (TypeError, ValueError):
+        return function
+    if any(p.kind == p.VAR_POSITIONAL for p in parameters):
+        return function
+    limit = sum(p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) for p in parameters)
+
+    @functools.wraps(function)
+    def adapted(*args, **kwargs):
+        return function(*args[:limit], **kwargs)
+
+    return adapted
+
+
+{entry_point} = kloer_accept_extra_args({entry_point})
+"""
+
+
+def finalize_code(code: str, problem: dict[str, Any]) -> str:
+    """Deterministic robustness for the evaluation harness (no change to the function's logic).
+
+    - `from collections import Counter`: some MBPP expected outputs are Counter
+      objects that the test script builds without importing it.
+    - A lower-case alias of the entry point (a prompt says left_Rotate, its tests call
+      left_rotate), unless it would shadow a builtin (Sum -> sum) or a keyword.
+    - For tasks without a signature, extra trailing positional arguments are ignored: tests often
+      pass a redundant length (f(arr, n)) to a function written as f(arr). Only calls that would
+      otherwise raise TypeError behave differently.
+    """
+    entry_point = problem["entry_point"]
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code
+    if entry_function(tree, entry_point) is None:
+        return code
+    names = top_level_names(tree)
+    parts = [code.rstrip() + "\n"]
+    if "Counter" not in names:  # appended, so that a `from __future__` import stays first
+        parts.append("\nfrom collections import Counter\n")
+    if not has_signature(problem["prompt"], entry_point):
+        parts.append(ACCEPT_EXTRA_ARGS.replace("{entry_point}", entry_point))
+    lower = entry_point.lower()
+    shadows = lower in dir(builtins) or keyword.iskeyword(lower)  # e.g. Sum -> sum
+    if lower != entry_point and lower not in names and lower.isidentifier() and not shadows:
+        parts.append(f"\n{lower} = {entry_point}\n")
+    return "".join(parts)
+
+
 # Algorithm ------------------------------------------------------------------------------------
+
+
+def new_exploration() -> dict[str, Any]:
+    return {"candidates": [], "arity": None, "offered": None}
 
 
 class Kloer(ClarificationAlgorithmBase):
@@ -387,6 +886,16 @@ class Kloer(ClarificationAlgorithmBase):
         "repair_spec": True,  # implement from a repaired, structured specification
         "neutralize_name": True,  # neutral function name in the spec, when the task has a signature
         "coder_sees_original": False,  # also show the original task to the spec coder
+        "use_execution": True,  # explore candidates and verify by execution (False = Kloer 0.2)
+        "num_interpretations": 3,  # candidate implementations, one per reading
+        "num_probes": 8,  # probe inputs used to compare the candidates
+        "exec_timeout_s": 2.0,  # time limit per call inside the execution harness
+        "prefer_contradiction": True,  # keep the analyst's question when it is about a contradiction
+        "arity_strategy": "optional",  # argument-count disagreement: "optional", "question" or "off"
+        "verify_final": True,  # run the final code on the specification's examples
+        "self_debug": True,  # one repair round from execution feedback
+        "finalize": True,  # harness robustness: Counter import, lower-case alias, extra arguments
+        "trace": True,  # append a one-line comment recording the decisions taken
     }
 
     def format_clarifications(self, clarifications: list[tuple[str, str]]) -> str:
@@ -403,7 +912,7 @@ class Kloer(ClarificationAlgorithmBase):
             "{prompt}", problem["prompt"]
         )
 
-    # 1-2. Analyse and ask ----------------------------------------------------------------------
+    # 1. Analyse ---------------------------------------------------------------------------------
 
     def analyse(
         self,
@@ -419,11 +928,167 @@ class Kloer(ClarificationAlgorithmBase):
     def fallback_question(self, env: ClarificationEnvironment, problem: dict[str, Any]) -> str:
         return clean_question(env.llm(self.fill(FALLBACK_QUESTION_PROMPT, problem)))
 
+    # 2. Explore ---------------------------------------------------------------------------------
+
+    def execute(
+        self,
+        env: ClarificationEnvironment,
+        codes: list[str],
+        entry_point: str,
+        inputs: list[list[Any]],
+        expected: list[Any] | None = None,
+    ) -> list[list[list[str]] | None] | None:
+        """Runs every code on every input in one sandboxed execution; None if nothing ran."""
+        script = build_harness(codes, entry_point, inputs, expected, self.config["exec_timeout_s"])
+        try:
+            output = env.exec_code(script)
+        except Exception:
+            return None
+        rows = parse_harness_output(str(output), len(codes))
+        return rows if any(row is not None for row in rows) else None
+
+    def write_candidates(
+        self, env: ClarificationEnvironment, problem: dict[str, Any], readings: list[str]
+    ) -> list[dict[str, Any]]:
+        entry_point = problem["entry_point"]
+        candidates = []
+        for reading in readings:
+            content = self.fill(CANDIDATE_PROMPT, problem, reading=reading)
+            code, _ = self.generate(env, content, entry_point, entry_point, attempts=1)
+            if code is not None:
+                candidates.append(
+                    {"reading": reading, "code": code, "params": entry_params(code, entry_point)}
+                )
+        return candidates
+
+    def probe_inputs(
+        self, env: ClarificationEnvironment, problem: dict[str, Any], candidate: dict[str, Any]
+    ) -> list[list[Any]]:
+        entry_point = problem["entry_point"]
+        params = candidate["params"]
+        if params is None:
+            return []
+        required = required_count(candidate["code"], entry_point)
+        prompt = self.fill(
+            PROBE_PROMPT,
+            problem,
+            n=str(self.config["num_probes"]),
+            signature=signature_line(candidate["code"], entry_point),
+        )
+        return parse_probe_inputs(
+            env.llm(prompt),
+            entry_point,
+            len(params) if required is None else required,
+            len(params),
+            self.config["num_probes"],
+        )
+
+    def value_question(
+        self,
+        env: ClarificationEnvironment,
+        problem: dict[str, Any],
+        offered: dict[str, str],
+        reading_a: str,
+        reading_b: str,
+    ) -> str:
+        values = {"call": offered["call"], "value_a": offered["a"], "value_b": offered["b"]}
+        prompt = self.fill(
+            VALUE_QUESTION_PROMPT, problem, reading_a=reading_a, reading_b=reading_b, **values
+        )
+        question = clean_question(env.llm(prompt))
+        if not question.endswith("?") or len(question) > 500:
+            template = VALUE_QUESTION_TEMPLATE
+            for key, value in values.items():
+                template = template.replace("{" + key + "}", value)
+            question = clean_question(template)
+        return question
+
+    def explore(
+        self,
+        env: ClarificationEnvironment,
+        problem: dict[str, Any],
+        analysis: dict[str, Any],
+        exploration: dict[str, Any],
+        trace: dict[str, Any],
+        ask: bool = True,
+    ) -> str | None:
+        """Writes and runs candidates; returns an execution-grounded question, or None.
+
+        With ask=False the candidates are still written (for the arity rule and for verification)
+        but no question is derived from them.
+        """
+        entry_point = problem["entry_point"]
+        readings = analysis.get("interpretations")
+        readings = (
+            [str(r).strip() for r in readings if str(r).strip()]
+            if isinstance(readings, list)
+            else []
+        )
+        readings = list(dict.fromkeys(readings))[: self.config["num_interpretations"]]
+        if len(readings) < 2:
+            trace["explore"] = "no-readings"
+            return None
+        candidates = self.write_candidates(env, problem, readings)
+        exploration["candidates"] = candidates
+        trace["cands"] = len(candidates)
+        if len(candidates) < 2:
+            return None
+
+        # Argument count (tasks without a signature only).
+        known = [c["params"] for c in candidates if c["params"] is not None]
+        strategy = self.config["arity_strategy"]
+        if (
+            strategy != "off"
+            and not has_signature(problem["prompt"], entry_point)
+            and len({len(p) for p in known}) > 1
+        ):
+            short, long = min(known, key=len), max(known, key=len)
+            exploration["arity"] = (short, long)
+            trace["arity"] = [len(short), len(long)]
+            if strategy == "question" and ask:
+                return clean_question(
+                    ARITY_QUESTION_TEMPLATE.replace("{entry_point}", entry_point)
+                    .replace("{short}", ", ".join(short))
+                    .replace("{long}", ", ".join(long))
+                )
+
+        if not ask:
+            return None
+
+        # Behaviour on probe inputs.
+        inputs = self.probe_inputs(env, problem, candidates[0])
+        trace["probes"] = len(inputs)
+        if not inputs:
+            return None
+        rows = self.execute(env, [c["code"] for c in candidates], entry_point, inputs)
+        if rows is None:
+            trace["exec"] = "failed"
+            return None
+        found = distinguishing_input(rows)
+        if found is None:
+            trace["groups"] = 1
+            return None
+        position, a, b, groups = found
+        trace["groups"] = groups
+        offered = {
+            "args": inputs[position],
+            "call": call_text(entry_point, inputs[position]),
+            "a": rows[a][position][1],
+            "b": rows[b][position][1],
+        }
+        exploration["offered"] = offered
+        return self.value_question(
+            env, problem, offered, candidates[a]["reading"], candidates[b]["reading"]
+        )
+
+    # 3. Ask -------------------------------------------------------------------------------------
+
     def clarify(
-        self, env: ClarificationEnvironment, problem: dict[str, Any]
-    ) -> tuple[list[tuple[str, str]], list[str]]:
+        self, env: ClarificationEnvironment, problem: dict[str, Any], trace: dict[str, Any]
+    ) -> tuple[list[tuple[str, str]], list[str], dict[str, Any]]:
         clarifications: list[tuple[str, str]] = []
         assumptions: list[str] = []
+        exploration = new_exploration()
         for _ in range(self.config["max_questions"]):
             if not env.can_ask():
                 break
@@ -434,22 +1099,66 @@ class Kloer(ClarificationAlgorithmBase):
                 str(p["assumption"]) for p in points if p.get("resolvable") and p.get("assumption")
             ]
             question = clean_question(str(analysis.get("question") or ""))
+            source = "analyst"
+            # A quoted contradiction between two statements is asked about directly.
+            contradiction = any(
+                "contradict" in str(p.get("type", "")).lower()
+                and not p.get("resolvable", False)
+                and str(p.get("source_b") or "").strip()
+                for p in points
+            )
+            keep_analyst = bool(question) and contradiction and self.config["prefer_contradiction"]
+            if keep_analyst:
+                source = "contradiction"
+            if self.config["use_execution"] and not clarifications:
+                explored = self.explore(
+                    env, problem, analysis, exploration, trace, ask=not keep_analyst
+                )
+                if explored:
+                    question = explored
+                    source = "arity" if exploration["offered"] is None else "value"
             has_open_point = any(not p.get("resolvable", False) for p in points)
             if not (has_open_point or self.config["always_ask"]):
                 break
             if not question and not clarifications:
                 # Analysis failed or returned no question: still use the turn.
-                question = self.fallback_question(env, problem)
+                question = self.fallback_question(env, problem) or self.fallback_question(
+                    env, problem
+                )
+                source = "fallback"
+                if not question:
+                    question = GENERIC_QUESTION.replace("{entry_point}", problem["entry_point"])
+                    source = "generic"
             if not question:
                 break
             try:
                 answer = env.ask_human(question)
             except TooManyQuestionException:
                 break
+            trace["q"] = source
             clarifications.append((question, answer))
-        return clarifications, assumptions
+        return clarifications, assumptions, exploration
 
-    # 3. Repair ----------------------------------------------------------------------------------
+    # 4. Repair ----------------------------------------------------------------------------------
+
+    def extra_rules(self, exploration: dict[str, Any], for_repair: bool) -> str:
+        rules = []
+        arity = exploration.get("arity")
+        if arity and self.config["arity_strategy"] == "optional":
+            short, long = arity
+            rules.append(
+                ARITY_RULE.replace("{k}", str(len(short)))
+                .replace("{m}", str(len(long)))
+                .replace("{params}", ", ".join(long))
+            )
+        offered = exploration.get("offered")
+        if offered and for_repair:
+            rules.append(
+                OFFERED_RULE.replace("{call}", offered["call"])
+                .replace("{value_a}", offered["a"])
+                .replace("{value_b}", offered["b"])
+            )
+        return "".join("\n- " + rule for rule in rules)
 
     def repair(
         self,
@@ -457,6 +1166,7 @@ class Kloer(ClarificationAlgorithmBase):
         problem: dict[str, Any],
         clarifications: list[tuple[str, str]],
         assumptions: list[str],
+        exploration: dict[str, Any],
     ) -> tuple[str | None, str]:
         """Returns the repaired specification (None on failure) and the function name it uses."""
         entry_point = problem["entry_point"]
@@ -467,21 +1177,27 @@ class Kloer(ClarificationAlgorithmBase):
             REPAIR_PROMPT,
             problem,
             naming_rule=naming_rule,
+            extra_rules=self.extra_rules(exploration, for_repair=True),
             name=name,
             clarifications=self.format_clarifications(clarifications),
             assumptions="\n".join(f"- {a}" for a in assumptions) or "(none)",
         )
         return clean_spec(env.llm(prompt), entry_point, name), name
 
-    # 4. Implement -------------------------------------------------------------------------------
+    # 5. Implement and verify --------------------------------------------------------------------
 
     def generate(
-        self, env: ClarificationEnvironment, content: str, entry_point: str, name: str
+        self,
+        env: ClarificationEnvironment,
+        content: str,
+        entry_point: str,
+        name: str,
+        attempts: int | None = None,
     ) -> tuple[str | None, str]:
         """Returns the sanitised code (None if no valid implementation) and the last response."""
         messages = [{"role": "user", "content": content}]
         response = ""
-        for _ in range(self.config["generation_attempts"]):
+        for _ in range(attempts or self.config["generation_attempts"]):
             response = env.llm(messages)
             code = extract_code(response, entry_point, name if name != entry_point else None)
             if code is not None:
@@ -499,12 +1215,14 @@ class Kloer(ClarificationAlgorithmBase):
         spec: str,
         name: str,
         clarifications: list[tuple[str, str]],
+        exploration: dict[str, Any],
     ) -> tuple[str | None, str]:
         original = ""
         if self.config["coder_sees_original"]:
             original = ORIGINAL_SECTION.replace("{prompt}", problem["prompt"])
         content = (  # the task text (inside `original`) goes last, so braces inside it are kept
             SPEC_CODER_PROMPT.replace("{name}", name)
+            .replace("{extra_rules}", self.extra_rules(exploration, for_repair=False))
             .replace("{clarifications}", self.format_clarifications(clarifications))
             .replace("{spec}", spec)
             .replace("{original}", original)
@@ -528,21 +1246,115 @@ class Kloer(ClarificationAlgorithmBase):
         )
         return self.generate(env, content, entry_point, entry_point)
 
+    def debug(
+        self,
+        env: ClarificationEnvironment,
+        problem: dict[str, Any],
+        spec: str,
+        name: str,
+        clarifications: list[tuple[str, str]],
+        code: str,
+        checks: list[tuple[list[Any], Any]],
+        row: list[list[str]],
+    ) -> str | None:
+        failures = []
+        for (args, expected), cell in zip(checks, row, strict=False):
+            if cell[0] != "pass":
+                got = cell[1] if cell[0] == "fail" else f"raised {cell[1]}"
+                failures.append(f"- {call_text(name, args)}: expected {expected!r}, got {got}")
+        if not failures:
+            return None
+        content = (
+            DEBUG_PROMPT.replace("{name}", name)
+            .replace("{failures}", "\n".join(failures))
+            .replace("{clarifications}", self.format_clarifications(clarifications))
+            .replace("{spec}", spec)
+            .replace("{code}", code)
+        )
+        fixed, _ = self.generate(env, content, problem["entry_point"], name, attempts=1)
+        return fixed
+
+    def verify(
+        self,
+        env: ClarificationEnvironment,
+        problem: dict[str, Any],
+        spec: str,
+        name: str,
+        clarifications: list[tuple[str, str]],
+        code: str,
+        exploration: dict[str, Any],
+        trace: dict[str, Any],
+    ) -> str:
+        """Checks the final code on the result the user confirmed for the offered call.
+
+        Only that example is trusted: the specification's other examples come from the task
+        (deliberately wrong in contradictory variants) or from the model. If the code fails it,
+        one self-debugging round is tried and kept only if it passes.
+        """
+        offered = exploration.get("offered")
+        if not offered:
+            return code
+        entry_point = problem["entry_point"]
+        checks = [
+            check
+            for check in parse_spec_examples(spec, {name, entry_point})
+            if repr(check[0]) == repr(offered["args"])
+        ][:1]
+        trace["checks"] = len(checks)
+        if not checks:
+            return code
+        inputs, expected = [checks[0][0]], [checks[0][1]]
+        rows = self.execute(env, [code], entry_point, inputs, expected)
+        if rows is None or rows[0] is None:
+            trace["verify"] = "exec-failed"
+            return code
+        if rows[0][0][0] == "pass":
+            trace["verify"] = "final-pass"
+            return code
+        if self.config["self_debug"]:
+            fixed = self.debug(env, problem, spec, name, clarifications, code, checks, rows[0])
+            if fixed is not None:
+                again = self.execute(env, [fixed], entry_point, inputs, expected)
+                if again and again[0] and again[0][0][0] == "pass":
+                    trace["verify"] = "debug-pass"
+                    return fixed
+        trace["verify"] = "kept-failing"
+        return code
+
     def run(self, env: ClarificationEnvironment, problem: dict[str, Any]) -> str:
+        trace: dict[str, Any] = {"v": KLOER_VERSION, "q": "none"}
         clarifications: list[tuple[str, str]] = []
         assumptions: list[str] = []
+        exploration = new_exploration()
         code: str | None = None
         response = ""
         try:
-            clarifications, assumptions = self.clarify(env, problem)
+            clarifications, assumptions, exploration = self.clarify(env, problem, trace)
+            spec, name = None, problem["entry_point"]
             if self.config["repair_spec"]:
-                spec, name = self.repair(env, problem, clarifications, assumptions)
+                spec, name = self.repair(env, problem, clarifications, assumptions, exploration)
                 if spec is not None:
                     code, response = self.implement_from_spec(
-                        env, problem, spec, name, clarifications
+                        env, problem, spec, name, clarifications, exploration
                     )
             if code is None:
+                trace["coder"] = "fallback"
                 code, response = self.implement(env, problem, clarifications, assumptions)
+            if (
+                code is not None
+                and spec is not None
+                and self.config["use_execution"]
+                and self.config["verify_final"]
+            ):
+                code = self.verify(
+                    env, problem, spec, name, clarifications, code, exploration, trace
+                )
         except LimitsExceededException:
-            pass
-        return code if code is not None else response
+            trace["limit"] = True
+        if code is None:
+            return response
+        if self.config["finalize"]:
+            code = finalize_code(code, problem)
+        if self.config["trace"]:
+            code += "\n\n# kloer-trace: " + json.dumps(trace)
+        return code
